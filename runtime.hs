@@ -1,8 +1,5 @@
 -- What is to be done
--- make a new parsing thing a step under T where it looks for parenthese with arguments after an IDEN_TOK
--- if there are then it's like you calling the thing behind with args, so you dont need to parse for funcall directly bc this will do it
--- but this will also parse indirect calling like : oui()() calls the thing return by oui
---
+-- add string support ??
 -- add array support ???
 --
 --
@@ -123,7 +120,7 @@ print [] = return
 data ValueNode = INT_VAL Int -- 43
                | FLOAT_VAL Float -- 3.14
                | BOOL_VAL Bool -- true | false
-               | CALLABLE [String] StatementNode -- my_func_name (NOT my_func_name() !!!)
+               | CALLABLE [String] StatementNode ContextFrames -- my_func_name (NOT my_func_name() !!!)
                deriving Show
 
 data ExprNode = N_ADD ExprNode ExprNode
@@ -133,14 +130,14 @@ data ExprNode = N_ADD ExprNode ExprNode
           | N_DIV ExprNode ExprNode
           | N_CONST_VAL ValueNode
           | N_VAR_VAL String
-          | N_FUNC_CALL String [ExprNode]
+          | N_FUNC_CALL ExprNode [ExprNode]
           | N_BLOCK_WRAPPER StatementNode
           deriving Show
 
 data StatementNode = N_IF { condition :: ExprNode, thenStatement :: StatementNode, elseStatement :: Maybe StatementNode}
                    | N_ASSIGN {varName :: String, val :: ExprNode}
                    | N_BLOCK [StatementNode]
-                   | N_FUNC_CALL_WRAPPER { funcName :: String, args :: [ExprNode]}
+                   | N_FUNC_CALL_WRAPPER { exprToCall :: ExprNode} -- exprToCall will alway be a N_FUNC_CALL
                    | N_FUNC_DEF {funcName :: String, argsName :: [String], body :: StatementNode}
                    | N_RETURN ExprNode
                    | N_BUILTIN_PRINT 
@@ -177,23 +174,14 @@ getVarValue :: String -> ContextFrames -> (Maybe ValueNode)
 getVarValue s [] = Nothing
 getVarValue s c = case Map.lookup s (last c) of
     Nothing -> getVarValue s (init c)
+    -- if it is a CALLABLE then put it's context with it
+    Just (CALLABLE argsName body _) -> Just $ CALLABLE argsName body c
     Just i -> Just i
 
 getVar :: String -> State ContextFrames (Maybe ValueNode)
 getVar s = do
     c <- get
     return (getVarValue s c)
-
-getVarValueAndContext :: String -> ContextFrames -> Maybe (ValueNode, ContextFrames)
-getVarValueAndContext s [] = Nothing
-getVarValueAndContext s c = case Map.lookup s (last c) of
-    Nothing -> getVarValueAndContext s (init c)
-    Just i -> Just (i, c)
-
-getVarAndContext :: String -> State ContextFrames (Maybe (ValueNode, ContextFrames))
-getVarAndContext s = do
-    c <- get
-    return (getVarValueAndContext s c)
 
 evalArgs :: [ExprNode] -> [ValueNode] -> StateT ContextFrames IO([ValueNode])
 evalArgs (ex:exs) prev_v = do
@@ -209,14 +197,12 @@ passArgsToFunc [] [] = return ()
 passArgsToFunc [] s = error "Function needs more parameters"
 passArgsToFunc v [] = error "Function doesn't take this much params"
 
-callFunc :: String -> [ExprNode] -> StateT ContextFrames IO(Maybe ValueNode)
-callFunc s args = do
-    v <- hoist $ getVarAndContext s
+runFunction :: Maybe ValueNode -> [ExprNode] -> StateT ContextFrames IO(Maybe ValueNode)
+runFunction v args = do
     case v of
-        Just (CALLABLE argsName body, c) -> do
+        Just (CALLABLE argsName body c) -> do
             vs <- evalArgs args []
             let (_, ns) = runState (passArgsToFunc vs argsName) c
-            -- here change evalStatement to evalFuc or block
             case body of
                 N_BLOCK ss -> do
                     (ret_val, _) <- liftIO $ runStateT (evalBlock ss) ns
@@ -229,8 +215,20 @@ callFunc s args = do
                     return Nothing
         Nothing -> do 
             debug <- get
-            error ("Function " ++ s ++ " not found" ++ show debug)
-        otherwise -> error (s ++ " is a variable not a function")
+            error ("Function not found or not callable " ++ show debug)
+        otherwise -> error ("you tried to call a variable not a function")
+
+
+callFunc :: ExprNode -> [ExprNode] -> StateT ContextFrames IO(Maybe ValueNode)
+callFunc (N_VAR_VAL s) args = do
+    v <- hoist $ getVar s
+    ret <- runFunction v args
+    return ret
+callFunc (N_FUNC_CALL e args) aargs = do
+    v <- callFunc e args
+    ret <- runFunction v aargs
+    return ret
+callFunc _ _ = error "Your calling something that isn't callable"
 
 evalBlock :: [StatementNode] -> StateT ContextFrames IO(Maybe ValueNode)
 evalBlock (N_RETURN e:ss) = do
@@ -256,11 +254,13 @@ evalStatement (N_BLOCK ss) = do
     hoist $ popContextFrame
     return ()
 evalStatement (N_FUNC_DEF s args b) = do
-    hoist $ assignValueToVar s (CALLABLE args b)
+    -- context will by filled when retrived with getVar
+    hoist $ assignValueToVar s (CALLABLE args b [])
     return ()
-evalStatement (N_FUNC_CALL_WRAPPER s args) = do
-    _ <- callFunc s args
+evalStatement (N_FUNC_CALL_WRAPPER (N_FUNC_CALL e args)) = do
+    _ <- callFunc e args
     return ()
+evalStatement (N_FUNC_CALL_WRAPPER _) = error "No N_FUNC_CALL inside N_FUNC_CALL_WRAPPER very strange..."
 evalStatement (N_ASSIGN s e) = do
     ee <- evalExpr e
     hoist (assignValueToVar s ee)
@@ -294,25 +294,25 @@ toNumber :: ValueNode -> Number
 toNumber (INT_VAL v) = INT_NUM v
 toNumber (FLOAT_VAL v) = FLOAT_NUM v
 toNumber (BOOL_VAL v) = if v then INT_NUM 1 else INT_NUM 0
-toNumber (CALLABLE _ _) = error "Can convert function to number"
+toNumber (CALLABLE _ _ _) = error "Can convert function to number"
 
 toInt :: ValueNode -> Int
 toInt (INT_VAL v) = v
 toInt (FLOAT_VAL v) = round v -- COERCE FLOAT TO INT BY ITSELF THROW AN ERROR INSTEAD IF YOU WHICH IT COULDN'T BE DONE
 toInt (BOOL_VAL v) = if v then 1 else 0
-toInt (CALLABLE _ _) = error "Can convert function to int"
+toInt (CALLABLE _ _ _) = error "Can convert function to int"
 
 toFloat :: ValueNode -> Float
 toFloat (INT_VAL v) = fromIntegral v
 toFloat (FLOAT_VAL v) = v
 toFloat (BOOL_VAL v) = if v then 1.0 else 0.0
-toFloat (CALLABLE _ _) = error "Can convert function to float"
+toFloat (CALLABLE _ _ _) = error "Can convert function to float"
 
 toBool :: ValueNode -> Bool
 toBool (INT_VAL v) =  if v /= 0 then True else False
 toBool (FLOAT_VAL v) =  if v /= 0.0 then True else False
 toBool (BOOL_VAL v) =  v
-toBool (CALLABLE _ _) = error "Can convert function to bool"
+toBool (CALLABLE _ _ _) = error "Can convert function to bool"
 
 inferRetNumType :: (Float -> Float -> Float) -> (Int -> Int -> Int) -> ExprNode -> ExprNode -> StateT ContextFrames IO(ValueNode)
 inferRetNumType floatOpe intOpe l r = do
@@ -341,8 +341,8 @@ evalExpr (N_VAR_VAL s) = do
     case v of
         Nothing -> error ("Variable " ++ s ++ " not found")
         Just n -> return n
-evalExpr (N_FUNC_CALL s args) = do
-    r <- callFunc s args
+evalExpr (N_FUNC_CALL e args) = do
+    r <- callFunc e args
     case r of
         Just e -> return e
         Nothing -> error "A function in an expression didn't return any value"
@@ -453,7 +453,8 @@ parseS = do
                     return N_ASSIGN { varName = s, val = value}
                 OPAR_TOK -> do
                     arguments <- parseArgsFuncCall []
-                    return N_FUNC_CALL_WRAPPER { funcName = s, args = arguments}
+                    e <- parseC (N_FUNC_CALL (N_VAR_VAL s) arguments)
+                    return N_FUNC_CALL_WRAPPER { exprToCall = e}
                 otherwise -> error "Error parsing the statement"
         EOF_TOK -> return EOF
         otherwise -> do
@@ -509,18 +510,14 @@ parseF' ln = do
                     return e
                 else return ln
 
--- T -> 42 | 3.14 | true | my_var_name | my_func_name | (E) | -E | { S+ RETURN E }
+-- T -> 42 | 3.14 | true | my_var_name | (E) | -E | { S+ RETURN E }
 parseT :: State [Token] ExprNode
 parseT = do
     t <- nextToken
     case t of
         IDEN_TOK s -> do
-            c <- acceptToken OPAR_TOK
-            if c
-                then do
-                    arguments <- parseArgsFuncCall []
-                    return (N_FUNC_CALL s arguments)
-                else return (N_VAR_VAL s)
+            ret <- parseC (N_VAR_VAL s) -- check if there are parenthese like it would be a callable
+            return ret
         INT_TOK v -> return (N_CONST_VAL (INT_VAL v))
         FLOAT_TOK v -> return (N_CONST_VAL (FLOAT_VAL v))
         BOOL_TOK v -> return (N_CONST_VAL (BOOL_VAL v))
@@ -535,6 +532,17 @@ parseT = do
             b <- parseB []
             return (N_BLOCK_WRAPPER b)
         otherwise -> error "Failed to parse expression"
+
+-- C -> (args, ...)
+parseC :: ExprNode -> State [Token] ExprNode
+parseC e = do
+    c <- acceptToken OPAR_TOK
+    if c
+        then do
+            args <- parseArgsFuncCall []
+            ret <- parseC (N_FUNC_CALL e args)
+            return ret
+        else return e
         
 main :: IO()
 main = do
@@ -543,5 +551,5 @@ main = do
     -- printTokens tokens
     let ast = evalState parseS ([OCURLY_TOK] ++ tokens ++ [CCURLY_TOK])
     -- putStr $ show ast
-    _ <- runStateT (evalStatement ast) [Map.singleton "print" (CALLABLE ["toPrint"] (N_BUILTIN_PRINT))]
+    _ <- runStateT (evalStatement ast) [Map.singleton "print" (CALLABLE ["toPrint"] (N_BUILTIN_PRINT) [])]
     return ()
